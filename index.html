@@ -128,6 +128,17 @@ main{max-width:1200px}
   </div>
 </div>
 
+<div id="rec-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;z-index:100;padding:16px;">
+  <div class="card" style="max-width:560px;width:100%;max-height:80vh;overflow-y:auto;">
+    <div class="row" style="justify-content:space-between;align-items:center;">
+      <h3 id="rec-title" style="margin:0;"></h3>
+      <button class="small" id="rec-close" style="width:20px;height:20px;padding:0;font-size:11px;line-height:1;flex:0 0 auto;min-width:0;" aria-label="Cerrar">✕</button>
+    </div>
+    <div id="rec-body"></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
 <script>
@@ -395,15 +406,53 @@ async function aplicarPago(deptoId,usd,fecha,ref){
   const mv={tipo:'ingreso',categoria:'Cuota de condominio',subcategoria:'',monto:total,descripcion:'Pago Apto '+(d?d.numero:'')+' — '+ref,fecha};
   if(db) await db.collection('movimientos').add(mv); else { addLocal(movs,mv); render(); }
 }
-function lineaHtml(){ return '<div class="row r-l"><input class="r_d" placeholder="Detalle (ej. Cuota agosto)"><input class="r_m" type="number" step="0.01" placeholder="Monto"></div>'; }
+function lineaHtml(){ return '<div class="r-l"><input class="r_d" placeholder="Detalle (ej. Cuota agosto)"></div>'; }
+function aviso(msg,ok){ const eb=g('error-banner'); eb.textContent=msg; eb.style.background=ok?'#dcfce7':'#fee2e2'; eb.style.color=ok?'#166534':'#991b1b'; eb.classList.remove('hidden'); }
+function nombrePdf(r){ return 'Recibo-'+r.numero+'-Apto'+(r.apto||'')+'.pdf'; }
+function pdfRecibo(r){
+  if(!window.jspdf) throw new Error('No se pudo cargar el generador de PDF (revisa la conexión a internet).');
+  const doc=new window.jspdf.jsPDF(); let y=22;
+  doc.setFont('helvetica','bold'); doc.setFontSize(16); doc.text('COMPROBANTE DE PAGO',105,y,{align:'center'}); y+=12; doc.setFontSize(11);
+  const L=(a,b)=>{ doc.setFont('helvetica','bold'); doc.text(a,20,y); doc.setFont('helvetica','normal'); doc.text(String(b||'-'),68,y); y+=8; };
+  L('Recibo N°:',r.numero); L('Fecha de pago:',r.fecha); L('Apto:',r.apto); L('Propietario:',r.propietario);
+  L('Moneda:',r.moneda); L('Tasa del día:',r.tasa?Number(r.tasa).toFixed(4)+' Bs/USD':'-'); L('Referencia:',r.referencia);
+  L('Tipo de transacción:',r.tipo); L('Banco emisor:',r.banco);
+  const det=(r.detalle||[]).map(x=>typeof x==='string'?x:(x.detalle||'')).filter(Boolean);
+  L('Detalle:',det[0]); det.slice(1).forEach(t=>{ doc.text(String(t),68,y); y+=7; });
+  L('Observaciones:',r.observaciones);
+  y+=4; doc.setFont('helvetica','bold'); doc.setFontSize(12);
+  doc.text('Total Bs: '+(Number(r.total_bs)||0).toLocaleString('es-VE',{minimumFractionDigits:2}),20,y); y+=8;
+  doc.text('Total USD: '+(Number(r.total_usd)||0).toFixed(2),20,y);
+  return doc;
+}
+async function entregarRecibo(r){
+  const d=deptos.find(x=>x.id===r.depto_id), email=(d&&d.email)||'';
+  const doc=pdfRecibo(r), name=nombrePdf(r), blob=doc.output('blob');
+  const asunto='Comprobante de pago N° '+r.numero+' - Apto '+(r.apto||''), cuerpo='Estimado(a) '+(r.propietario||'')+', le enviamos su comprobante de pago N° '+r.numero+'.';
+  const file=new File([blob],name,{type:'application/pdf'});
+  if(/Android|iPhone|iPad/i.test(navigator.userAgent)&&navigator.canShare&&navigator.canShare({files:[file]})){
+    try{ await navigator.share({files:[file],title:asunto,text:cuerpo}); return; }catch(e){ if(e&&e.name==='AbortError') return; }
+  }
+  doc.save(name);
+  if(!email){ aviso('Recibo guardado y PDF descargado. Este apartamento no tiene correo registrado.',true); return; }
+  aviso('Recibo guardado y PDF descargado. Se abrirá tu correo para '+email+': adjunta el PDF y envía.',true);
+  location.href='mailto:'+email+'?subject='+encodeURIComponent(asunto)+'&body='+encodeURIComponent(cuerpo+'\n\n(Adjunta el archivo '+name+' que se acaba de descargar.)');
+}
+function showRecibos(deptoId){
+  const d=deptos.find(x=>x.id===deptoId); if(!d) return;
+  g('rec-title').textContent='Recibos — Apto '+d.numero+(d.propietario?' · '+d.propietario:'');
+  const lst=recibos.filter(r=>r.depto_id===deptoId).sort((a,b)=>String(b.numero).localeCompare(String(a.numero)));
+  g('rec-body').innerHTML=lst.length?'<div class="tablewrap"><table><tr><th>N°</th><th>Fecha</th><th>Total</th><th>Referencia</th><th></th></tr>'+lst.map(r=>`<tr><td>${r.numero}</td><td>${r.fecha||''}</td><td>$${Number(r.total_usd||0).toFixed(2)} <small>Bs ${Number(r.total_bs||0).toLocaleString('es-VE',{minimumFractionDigits:2})}</small></td><td>${r.referencia||''}</td><td><button class="small" data-rec-pdf="${r.id}">PDF</button> <button class="small" data-rec-mail="${r.id}">Enviar por correo</button></td></tr>`).join('')+'</table></div>':'<p class="empty">Este apartamento aún no tiene recibos</p>';
+  g('rec-overlay').style.display='flex';
+}
 function proxRecibo(){ const n=recibos.map(r=>parseInt(r.numero)).filter(x=>x>=0); return n.length?String(Math.max(...n)+1).padStart(4,'0'):''; }
 function renderRecibo(){
   return `<div class="card" id="recibo"><h3 style="text-align:center">COMPROBANTE DE PAGO</h3>
   <div class="row"><div><label>Recibo N°</label><input id="r_num" value="${proxRecibo()}"></div><div><label>Fecha de pago</label><input id="r_fecha" type="date" value="${new Date().toISOString().slice(0,10)}"></div></div>
   <div class="row"><div><label>Apto</label><select id="r_apto"><option value="">—</option>${deptos.slice().sort(numSort).map(d=>`<option value="${d.id}">${d.numero}</option>`).join('')}</select></div><div><label>Propietario</label><input id="r_prop"></div></div>
-  <div class="row"><div><label>Moneda</label><select id="r_mon"><option>Bs</option><option>USD</option></select></div><div><label>Tasa del día (Bs/USD)</label><input id="r_tasa" type="number" step="0.0001" value="${tasa||''}"></div><div><label>Referencia</label><input id="r_ref"></div></div>
+  <div class="row"><div style="flex:0 0 80px;min-width:0"><label>Moneda</label><select id="r_mon"><option>Bs</option><option>USD</option></select></div><div><label>Monto</label><input id="r_monto" type="number" step="0.01" placeholder="0.00"></div><div><label>Tasa del día (Bs/USD)</label><input id="r_tasa" type="number" step="0.0001" value="${tasa||''}"></div><div><label>Referencia</label><input id="r_ref"></div></div>
   <div class="row"><div><label>Tipo de transacción</label><select id="r_tipo"><option>Transferencia</option><option>Pago móvil</option><option>Zelle</option><option>Efectivo</option><option>Depósito</option></select></div><div><label>Banco emisor</label><input id="r_banco"></div></div>
-  <label>Detalle (monto en la moneda elegida)</label><div id="r_lineas">${lineaHtml()}</div><button class="small" data-action="add-linea">+ Línea</button>
+  <label>Detalle</label><div id="r_lineas">${lineaHtml()}</div><button class="small" data-action="add-linea">+ Línea</button>
   <label style="display:block;margin-top:8px">Observaciones</label><input id="r_obs">
   <label style="display:block;margin-top:8px"><input type="checkbox" id="r_aplicar" checked style="width:auto;margin-right:6px">Aplicar este pago al historial del apartamento y al saldo del banco (el total en USD se reparte solo)</label>
   <p id="r_tot"><b>Total:</b></p>
@@ -411,19 +460,21 @@ function renderRecibo(){
 }
 function calcRecibo(){
   const mon=g('r_mon').value, t=Number(g('r_tasa').value)||0;
-  const s=[...document.querySelectorAll('.r_m')].reduce((a,i)=>a+(Number(i.value)||0),0);
+  const s=Number(g('r_monto').value)||0;
   const usd=mon==='USD'?s:(t?s/t:0), bs=mon==='Bs'?s:s*t;
   g('r_tot').innerHTML='<b>Total:</b> Bs '+bs.toLocaleString('es-VE',{minimumFractionDigits:2})+' · USD '+usd.toFixed(2);
   return {usd,bs};
 }
 async function guardarRecibo(){
   const t=calcRecibo(), d=deptos.find(x=>x.id===g('r_apto').value);
-  const data={numero:g('r_num').value.trim(),fecha:g('r_fecha').value,depto_id:d?d.id:'',apto:d?d.numero:'',propietario:g('r_prop').value.trim(),moneda:g('r_mon').value,tasa:Number(g('r_tasa').value)||0,referencia:g('r_ref').value.trim(),tipo:g('r_tipo').value,banco:g('r_banco').value.trim(),observaciones:g('r_obs').value.trim(),
-    detalle:[...document.querySelectorAll('.r-l')].map(r=>({detalle:r.querySelector('.r_d').value,monto:Number(r.querySelector('.r_m').value)||0})).filter(x=>x.monto),total_usd:t.usd,total_bs:t.bs};
-  if(!data.numero||!data.total_usd) throw new Error('Falta el N° de recibo o el monto.');
-  if(g('r_aplicar').checked&&d) await aplicarPago(d.id,data.total_usd,data.fecha,'Recibo '+data.numero);
-  if(db) await db.collection('recibos').add(data);
-  recibos.push(data); render();
+  const data={numero:g('r_num').value.trim(),fecha:g('r_fecha').value,depto_id:d?d.id:'',apto:d?d.numero:'',propietario:g('r_prop').value.trim(),moneda:g('r_mon').value,tasa:Number(g('r_tasa').value)||0,monto:Number(g('r_monto').value)||0,referencia:g('r_ref').value.trim(),tipo:g('r_tipo').value,banco:g('r_banco').value.trim(),observaciones:g('r_obs').value.trim(),
+    detalle:[...document.querySelectorAll('.r_d')].map(i=>i.value.trim()).filter(Boolean),total_usd:t.usd,total_bs:t.bs};
+  if(!d) throw new Error('Elige el apartamento.');
+  if(!data.numero||!data.total_usd) throw new Error('Falta el N° de recibo o el monto (si eliges Bs, indica también la tasa del día).');
+  if(g('r_aplicar').checked) await aplicarPago(d.id,data.total_usd,data.fecha,'Recibo '+data.numero);
+  if(db){ const ref=await db.collection('recibos').add(data); data.id=ref.id; } else { data.id='loc-'+Date.now(); recibos.push(data); }
+  render();
+  try{ await entregarRecibo(data); }catch(err){ aviso('Recibo guardado, pero falló el PDF/correo: '+err.message,false); }
 }
 
 function render(){
@@ -477,12 +528,12 @@ function renderDeptos(){
       <td>${d.propietario||''}${esArr && d.arrendatario_nombre ? '<br><span class="tag">Arrendatario: '+d.arrendatario_nombre+'</span>' : ''}<br><button class="small" data-action="ver-historial" data-id="${d.id}" style="margin-top:4px;">Historial</button></td>
       <td>${contactoLinea}</td>
       <td>${estado}</td>
-      <td><button class="small" data-action="pagar" data-id="${d.id}">Registrar pago</button></td>
+      <td><button class="small" data-action="ver-recibos" data-id="${d.id}">Ver recibos</button></td>
     </tr>`;
   }).join('');
   if(!deptos.length) rows = '<tr><td colspan="5" class="empty">Aún no hay apartamentos — agrégalos en Configuración</td></tr>';
   return `<div class="card tablewrap"><table>
-    <tr><th>Apto</th><th>Ocupante</th><th>Contacto</th><th>Estado (${mes})</th><th>Pago</th></tr>
+    <tr><th>Apto</th><th>Ocupante</th><th>Contacto</th><th>Estado (${mes})</th><th>Recibos</th></tr>
     ${rows}
   </table></div>`;
 }
@@ -706,7 +757,7 @@ appEl.addEventListener('click', async e=>{
     else if(action==='toggle-add-depto'){ showAddForm=true; render(); }
     else if(action==='importar-directorio') await importarDirectorio();
     else if(action==='restaurar-directorio') await restaurarDirectorioOriginal();
-    else if(action==='pagar'){ histPago=true; showHistorial(id,true); }
+    else if(action==='ver-recibos') showRecibos(id);
     else if(action==='ver-historial'){ histPago=false; showHistorial(id,HISTORIAL_EDITABLE); }
     else if(action==='add-mov') await agregarMov();
     else if(action==='del-mov') await borrarMov(id);
@@ -719,9 +770,7 @@ appEl.addEventListener('click', async e=>{
     else if(action==='save-recibo') await guardarRecibo();
     else if(action==='print') window.print();
   }catch(err){
-    const eb = document.getElementById('error-banner');
-    eb.textContent = 'Error: '+(err&&err.message?err.message:String(err));
-    eb.classList.remove('hidden');
+    aviso('Error: '+(err&&err.message?err.message:String(err)),false);
   }
 });
 appEl.addEventListener('change', e=>{
@@ -790,6 +839,13 @@ g('pago-aplicar').addEventListener('click', async ()=>{
     await aplicarPago(histDeptoId,x,g('pago-fecha').value||new Date().toISOString().slice(0,10),'Apto '+(d?d.numero:''));
     g('pago-monto').value=''; showHistorial(histDeptoId);
   }catch(err){ const eb=g('error-banner'); eb.textContent='Error: '+(err&&err.message?err.message:String(err)); eb.classList.remove('hidden'); document.getElementById('hist-overlay').style.display='none'; }
+});
+g('rec-close').addEventListener('click',()=>{ g('rec-overlay').style.display='none'; });
+g('rec-body').addEventListener('click', async e=>{
+  const p=e.target.closest('[data-rec-pdf]'), q=e.target.closest('[data-rec-mail]'); const b=p||q; if(!b) return;
+  const r=recibos.find(x=>x.id===(p?b.dataset.recPdf:b.dataset.recMail)); if(!r) return;
+  g('rec-overlay').style.display='none';
+  try{ if(p) pdfRecibo(r).save(nombrePdf(r)); else await entregarRecibo(r); }catch(err){ aviso('Error: '+err.message,false); }
 });
 document.getElementById('hist-body').addEventListener('click', async e=>{
   const b = e.target.closest('[data-hist-del]'); if(!b) return;
